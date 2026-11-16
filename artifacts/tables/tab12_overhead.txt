@@ -1,7 +1,9 @@
-% ===== tab:overhead =====
-L1 signing and validation & $0.002$ & -- & 0.002\\
-L2 monitors & $0.194$ & -- & --\\
-L3 cross-sensor consistency & $0.017$ & -- & --\\
+% ===== tab:overhead (CPU ms per 10 Hz cycle, memory MB, added latency ms) =====
+L1 signing & $0.000$ & -- & 0.000\\
+L1 in-loop verification (signature, replay window) & $0.001$ & -- & 0.001\\
+L2 filter and innovation tests & $0.038$ & 0.006 & --\\
+L2 IMU monitor & $0.003$ & -- & --\\
+L3 cross-sensor scan, amortised (per scan 0.106~ms) & $0.011$ & -- & --\\
 L4 trust and state machine & $0.000$ & -- & --\\
 \midrule
-Total & $0.212$ & $<0.01$ & $0.002$\\
+Total & $0.050$ ($0.053$) & $<0.01$ & $0.000$\\

@@ -3,7 +3,7 @@ Detector threshold calibration and learned (Isolation Forest) detector.
 """
 import numpy as np
 from sklearn.ensemble import IsolationForest
-from .config import DT, PFA, CUSUM_DELTA, CM_CONSEC, M_CONSEC, IMU_CONSEC, CFG
+from .config import DT, PFA, CUSUM_DELTA, CM_CONSEC, M_CONSEC, IMU_CONSEC, DET_WINDOW, CFG
 
 
 def calibrate(dur, K=40):
@@ -79,7 +79,7 @@ def train_if(dur, K=30):
 
     X = []
     for i in range(K):
-        for f, att in run_once([], 'F', 60000 + i, dur, rec=True)['feats']:
+        for f, att, _ in run_once([], 'F', 60000 + i, dur, rec=True)['feats']:
             if not att:
                 X.append(f)
     X = np.array(X)
@@ -90,27 +90,36 @@ def train_if(dur, K=30):
 
 
 def if_eval(model, thr, attacks, N, base, dur):
-    """Evaluate the learned detector: alarm on 3 consecutive anomalous scores."""
+    """Evaluate the learned detector with the same rules as ``run_once``:
+    alarm on M_CONSEC consecutive anomalous scores; detection = first alarm
+    within DET_WINDOW after onset; false alarm = an alarm before onset.  Time
+    comes from the step index of each feature sample (samples are missing
+    while GNSS is jammed).  Alarm onsets over the whole run are counted for
+    the attack-free false-alarm rate."""
     from .simulation import run_once
 
     rows = []
     for i in range(N):
-        feats = run_once(attacks, 'F', base + i, dur, 'noL3', rec=True)['feats']
-        X = np.array([f for f, _ in feats])
-        atts = [a for _, a in feats]
+        r = run_once(attacks, 'F', base + i, dur, 'noL3', rec=True)
+        feats, t_on = r['feats'], r['t_on']
+        X = np.array([f for f, _, _ in feats])
+        ks = [kk for _, _, kk in feats]
         sc = model.score_samples(X)
         below = 0
-        onset = None
-        alarm = None
-        for j, (s, a) in enumerate(zip(sc, atts)):
-            if onset is None and a:
-                onset = j
+        det_t = None
+        fa = False
+        onsets = 0
+        for s, kk in zip(sc, ks):
+            t = kk * DT
             below = below + 1 if s < thr else 0
-            if a and below >= M_CONSEC and alarm is None:
-                alarm = j
-            if (not a) and below >= M_CONSEC:
-                alarm = -1   # pre-onset false alarm
-        det = alarm is not None and alarm >= 0
-        lat = (alarm - onset) * DT if (det and onset is not None) else np.nan
-        rows.append((det, lat, alarm == -1))
+            if below == M_CONSEC:
+                onsets += 1
+            if below >= M_CONSEC:
+                if t < t_on:
+                    fa = True
+                elif t <= t_on + DET_WINDOW and det_t is None:
+                    det_t = t
+        rows.append(dict(detected=det_t is not None,
+                         latency=(det_t - t_on) if det_t is not None else np.nan,
+                         false_before=fa, alarm_onsets=onsets, t_on=t_on))
     return rows

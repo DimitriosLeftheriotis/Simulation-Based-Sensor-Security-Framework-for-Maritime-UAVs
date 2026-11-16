@@ -1,6 +1,8 @@
-% ===== tab:robustness (A2c maritime detection) =====
-Vessels in view & $2$ & $3$ & $4$ & $6$ & $8$\\
-Detection rate & $0.44$ & $0.96$ & $0.88$ & $0.94$ & $0.90$\\
+% ===== tab:robustness (A2c detection by F; Wilson 95% half-widths) =====
+Vessels in the scene & $2$ & $3$ & $4$ & $6$ & $8$\\
+Detection rate & $0.69$ & $0.97$ & $0.92$ & $0.96$ & $0.91$\\
+95\% CI ($\pm$) & $0.09$ & $0.04$ & $0.05$ & $0.04$ & $0.06$\\
 \midrule
 Radar $P_d$ & $0.5$ & $0.7$ & $0.9$\\
-Detection rate & $0.90$ & $0.93$ & $0.88$\\
+Detection rate & $0.94$ & $0.94$ & $0.97$\\
+95\% CI ($\pm$) & $0.05$ & $0.05$ & $0.04$\\

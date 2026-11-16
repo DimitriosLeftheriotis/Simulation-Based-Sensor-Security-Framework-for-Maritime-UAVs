@@ -9,10 +9,10 @@ Detection and trust layers:
 """
 import numpy as np
 from scipy.optimize import linear_sum_assignment
-from .attacks import inject_ais_attacks, a4_heading_bias
+from .attacks import inject_ais_attacks, a4_heading_bias, radar_suppressed
 from .config import (
     DT, SIGMA_R, SIGMA_BEAR, SIGMA_PSI, SIGMA_AIS, SIGMA_AIS_VEL,
-    EOIR_RANGE, AIS_REPORT_MIN, AIS_REPORT_MAX,
+    RADAR_RANGE, ASSOC_GATE, AIS_REPORT_MIN, AIS_REPORT_MAX,
     M_CONSEC, RADAR_SCAN, CM_CONSEC,
     ALPHA_DOWN, ALPHA_UP, TAU_ISO, TAU_REC,
     SIGMA_MAX, ISO_TIMEOUT, GNSS_TIMEOUT,
@@ -55,7 +55,7 @@ class B2Detector:
 class IMUMonitor:
     """IMU checks of Table 6, run at the 10 Hz cycle rate.
 
-    * Acceleration residual: accelerometer reading at step k-1 against the
+    * Acceleration residual: accelerometer sample of the interval (k-1, k] against the
       GNSS-derived acceleration (v_k - v_{k-1})/dt, evaluated whenever a valid
       GNSS velocity is available at both steps.  It uses the GNSS *velocity*,
       which position-spoofing leaves intact, so it remains usable while the
@@ -80,14 +80,15 @@ class IMUMonitor:
         self.stat_h = 0.0
 
     def update(self, a_imu, v_gnss, gnss_ok, dpsi):
-        """Return ``(acc_alarm, head_alarm)`` for this step."""
-        if gnss_ok and self.prev_v is not None and self.prev_a is not None:
-            r = self.prev_a - (v_gnss - self.prev_v) / DT
+        """Return ``(acc_alarm, head_alarm)`` for this step.  *a_imu* is the
+        IMU sample of the interval (k-1, k]; it is compared with the
+        GNSS-derived acceleration (v_k - v_{k-1})/dt over the same interval."""
+        if gnss_ok and self.prev_v is not None:
+            r = a_imu - (v_gnss - self.prev_v) / DT
             self.ema_a = (1 - self.alpha) * self.ema_a + self.alpha * r
             self.stat_a = float(np.hypot(self.ema_a[0], self.ema_a[1]))
             self.consec_a = self.consec_a + 1 if self.stat_a > CFG.imu_acc_thresh else 0
         self.prev_v = v_gnss.copy() if gnss_ok else None
-        self.prev_a = a_imu.copy()
         self.ema_h = (1 - self.alpha) * self.ema_h + self.alpha * dpsi
         self.stat_h = abs(self.ema_h)
         self.consec_h = self.consec_h + 1 if self.stat_h > CFG.imu_head_thresh else 0
@@ -113,61 +114,101 @@ class L3CrossCheck:
     def scan(self, k, t, truth_k, kf_x, vessels, vves, n_vessels,
              attacks, attacking, ais_off, psi_bias, rng,
              is_attack_phase, rec, rec_cm, rec_sp,
-             mag_heading=False, mag_off=0.0):
+             mag_heading=False, mag_off=0.0, kf_P=None):
         """Run one radar scan.  Returns ``(cm_alarm, ais_alarm, mar_ok,
-        mar_common, mar_n, false_tracks)``.
+        mar_common, mar_n, n_suppressed)``.
+
+        v5: realistic association.  Radar detections are anonymous; every
+        vessel's AIS report is received.  AIS report j predicts the
+        radar-relative position ``ap_j - x_hat`` from the *estimated* own
+        position (the true position is used only to synthesise the radar
+        measurements).  Pairs are gated on the Mahalanobis distance with the
+        radar (range / cross-range), heading, AIS (noise and dead-reckoning
+        staleness) and own-position covariances, and assigned with the
+        Hungarian method.  An idiosyncratic (AIS) inconsistency is either a
+        large spread among the associated pairs or a displaced vessel, i.e.
+        an unmatched AIS report inside radar range together with an unmatched
+        radar detection, while at least three vessels still associate.
 
         With ``mag_heading`` (IMU isolated by L4) the radar-to-geo conversion
-        uses the magnetometer heading instead of the AHRS heading: the error
-        then has the magnetometer's statistics and no IMU-induced bias.  The
-        same single normal draw is consumed either way."""
+        uses the magnetometer heading instead of the AHRS heading."""
         pd_radar = CFG.pd_radar
         psi_err = rng.normal(0, SIGMA_PSI)
         if mag_heading:
             psi_err = psi_err * (SIGMA_MAG / SIGMA_PSI) + mag_off
+            sig_psi = SIGMA_MAG
         else:
             psi_err += a4_heading_bias(attacks, attacking, psi_bias)
+            sig_psi = SIGMA_PSI
         cps, sps = np.cos(psi_err), np.sin(psi_err)
-        ais_p, rad_rel = [], []
-        false_tracks = 0
+        P2 = np.zeros((2, 2)) if kf_P is None else np.asarray(kf_P)
+
+        # radar: anonymous detections (true geometry + noise, rotated by the
+        # heading error); A6 suppresses detections
+        det = []
+        n_supp = 0
         for vi in range(n_vessels):
             rel = vessels[vi, k] - truth_k[:2]
-            if np.linalg.norm(rel) > EOIR_RANGE or rng.random() > pd_radar:
+            if np.linalg.norm(rel) > RADAR_RANGE or rng.random() > pd_radar:
+                continue
+            if radar_suppressed(attacks, attacking, rng):
+                n_supp += 1
                 continue
             rng_m = np.linalg.norm(rel) + rng.normal(0, SIGMA_R)
             bear = np.arctan2(rel[1], rel[0]) + rng.normal(0, SIGMA_BEAR)
             rr = rng_m * np.array([np.cos(bear), np.sin(bear)])
-            rr = np.array([cps * rr[0] - sps * rr[1],
-                           sps * rr[0] + cps * rr[1]])
-            # AIS: periodic, noisy position + velocity; dead-reckoned between
-            # reports (real AIS carries SOG/COG), so staleness is bounded.
+            det.append(np.array([cps * rr[0] - sps * rr[1], sps * rr[0] + cps * rr[1]]))
+
+        # AIS: every vessel reports periodically and is dead-reckoned between
+        # reports; A5 offsets the report of vessel 0
+        ais, age = [], []
+        for vi in range(n_vessels):
             if t - self.ais_last_t[vi] >= self.t_rep[vi]:
                 self.ais_last_pos[vi] = vessels[vi, k] + rng.normal(0, SIGMA_AIS, 2)
                 self.ais_last_vel[vi] = vves[vi] + rng.normal(0, SIGMA_AIS_VEL, 2)
                 self.ais_last_t[vi] = t
-            ap = self.ais_last_pos[vi] + self.ais_last_vel[vi] * (t - self.ais_last_t[vi])
-            ap, dropped = inject_ais_attacks(ap, vi, attacks, attacking, ais_off, rng)
-            if dropped:                         # A6: pair dropped
-                false_tracks += 1
-                continue
-            ais_p.append(ap)
-            rad_rel.append(rr)
+            a = t - self.ais_last_t[vi]
+            ap = self.ais_last_pos[vi] + self.ais_last_vel[vi] * a
+            ais.append(inject_ais_attacks(ap, vi, attacks, attacking, ais_off))
+            age.append(a)
 
         cm_alarm = ais_alarm = False
         mar_ok = False
         mar_common = None
         mar_n = 1
+        nd, na = len(det), len(ais)
+        if nd == 0 or na == 0:
+            return cm_alarm, ais_alarm, mar_ok, mar_common, mar_n, n_supp
 
-        if len(ais_p) >= 3:
-            ais_p = np.array(ais_p)
-            rad_rel = np.array(rad_rel)
-            C = np.linalg.norm(ais_p[:, None, :] -
-                               (truth_k[:2] + rad_rel)[None, :, :], axis=2)
-            ri, ci = linear_sum_assignment(C)
-            resid = (ais_p[ri] - kf_x[:2]) - rad_rel[ci]
+        D = np.array(det)
+        Apred = np.array(ais) - kf_x[:2]
+        BIG = 1e9
+        # vectorised Mahalanobis gate over all (detection, AIS report) pairs
+        rgn = np.maximum(np.linalg.norm(D, axis=1), 1.0)
+        U = D / rgn[:, None]
+        W = np.stack([-U[:, 1], U[:, 0]], axis=1)
+        Sr = ((SIGMA_R ** 2) * U[:, :, None] * U[:, None, :]
+              + ((rgn ** 2) * (SIGMA_BEAR ** 2 + sig_psi ** 2))[:, None, None] * W[:, :, None] * W[:, None, :])
+        sa = SIGMA_AIS ** 2 + (SIGMA_AIS_VEL * np.asarray(age)) ** 2
+        S = Sr[:, None] + sa[None, :, None, None] * np.eye(2) + P2
+        NU = Apred[None, :, :] - D[:, None, :]
+        d2 = np.einsum('ijk,ijk->ij', NU, np.linalg.solve(S, NU[..., None])[..., 0])
+        cost = np.where(d2 <= ASSOC_GATE, d2, BIG)
+        ri, ci = linear_sum_assignment(cost)
+        keep = cost[ri, ci] < BIG
+        ri, ci = ri[keep], ci[keep]
+        n_ass = len(ri)
+
+        if n_ass >= 3:
+            resid = Apred[ci] - D[ri]          # (p_AIS - x_hat) - r
             common = np.median(resid, axis=0)
             spread = float(np.max(np.linalg.norm(resid - common, axis=1)))
             cmag = float(np.linalg.norm(common))
+            matched_a = set(ci.tolist())
+            un_r = nd - n_ass
+            un_a = sum(1 for j in range(na)
+                       if j not in matched_a and np.linalg.norm(Apred[j]) <= RADAR_RANGE)
+            displaced = un_r >= 1 and un_a >= 1
             if rec and not is_attack_phase:
                 rec_cm.append(cmag)
                 rec_sp.append(spread)
@@ -176,18 +217,17 @@ class L3CrossCheck:
             else:
                 self.consec_cm = 0
             cm_alarm = self.consec_cm >= CM_CONSEC
-            self.consec_ais = (self.consec_ais + 1
-                               if (spread > CFG.spread_thresh and cmag < CFG.cm_thresh)
-                               else 0)
+            idio = (spread > CFG.spread_thresh and cmag < CFG.cm_thresh) or displaced
+            self.consec_ais = self.consec_ais + 1 if idio else 0
             ais_alarm = self.consec_ais >= CM_CONSEC
             if is_attack_phase:
                 self.peak_cm = max(self.peak_cm, cmag)
             if spread < CFG.spread_thresh:       # geometry self-consistent
                 mar_ok = True
                 mar_common = common
-                mar_n = len(ais_p)
+                mar_n = n_ass
 
-        return cm_alarm, ais_alarm, mar_ok, mar_common, mar_n, false_tracks
+        return cm_alarm, ais_alarm, mar_ok, mar_common, mar_n, n_supp
 
 
 class L4Trust:

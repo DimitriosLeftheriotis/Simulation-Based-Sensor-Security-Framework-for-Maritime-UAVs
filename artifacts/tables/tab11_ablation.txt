@@ -1,5 +1,5 @@
-% ===== tab:ablation =====
-Full framework & $100$ & $1.0$ & $8.3$ & $100$\\
-$-$ L1 (signing, validation) & $100$ & $1.0$ & $8.3$ & $100$\\
-$-$ cross-sensor (L3) & $100$ & $1.0$ & $9.4$ & $100$\\
-$-$ trust adaptation (L4) & $100$ & $1.0$ & $112.5$ & $38$\\
+% ===== tab:ablation (combined A1 + A2c + A3; detection %, latency s, RMSE m, integrity %, corridor %) =====
+Full framework & $100$ & $1.0$ & $8.2$ & $100$ & $100$\\
+$-$ L1 (signing, validation) & $100$ & $1.0$ & $8.2$ & $100$ & $100$\\
+$-$ cross-sensor (L3) & $100$ & $1.0$ & $9.3$ & $100$ & $100$\\
+$-$ trust adaptation (L4) & $100$ & $1.0$ & $102.6$ & $45$ & $69$\\

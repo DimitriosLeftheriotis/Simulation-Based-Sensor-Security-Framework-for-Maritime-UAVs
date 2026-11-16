@@ -4,7 +4,7 @@ robustness / calibration-generalisation sweeps.
 """
 import time, hashlib, tracemalloc
 import numpy as np
-from scipy.stats import t as tdist, wilcoxon, binomtest
+from scipy.stats import t as tdist, wilcoxon, binomtest, chi2
 from scipy.optimize import linear_sum_assignment
 from .config import DT, SPEED, SIGMA_R, MAVLINK_SIGN_BYTES, CFG
 
@@ -57,8 +57,8 @@ def robustness(N, dur):
 
 
 def calib_generalization(N, dur):
-    """A2: false-alarm rate when the deployment GNSS-noise level differs from the
-    (in-distribution) level the thresholds were calibrated on."""
+    """False-alarm rate (alarm onsets per hour of attack-free flight) when the
+    deployment GNSS-noise level differs from the calibration level."""
     from .simulation import run_once
 
     base = CFG.sigma_p
@@ -66,7 +66,7 @@ def calib_generalization(N, dur):
     for mult, lab in [(1.0, 'matched'), (1.5, 'x1.5'), (2.0, 'x2.0')]:
         CFG.sigma_p = base * mult
         r = [run_once([], 'F', 90000 + i, dur) for i in range(N)]
-        out[lab] = float(np.mean([x['false_before'] for x in r]) / (dur / 3600.0))
+        out[lab] = far_summary(r, dur)
     CFG.sigma_p = base
     return out
 
@@ -83,41 +83,81 @@ def mcnemar_p(a, b):
     return float(binomtest(min(b01, b10), nd, 0.5).pvalue)
 
 
+def far_summary(runs, dur):
+    """Attack-free false alarms: alarm onsets over the whole run per hour of
+    flight (exact Poisson 95% interval) and the number of runs with any alarm."""
+    hours = len(runs) * dur / 3600.0
+    ev = int(sum(x['alarm_onsets'] for x in runs))
+    lo = float(chi2.ppf(0.025, 2 * ev) / 2 / hours) if ev else 0.0
+    hi = float(chi2.ppf(0.975, 2 * ev + 2) / 2 / hours)
+    return dict(rate=ev / hours, rate_ci=[lo, hi], events=ev, hours=hours,
+                runs_with_alarm=int(sum(x['alarm_onsets'] > 0 for x in runs)),
+                runs=len(runs))
+
+
+def holm(pvals):
+    """Holm-Bonferroni adjusted p-values for a dict {name: p}."""
+    items = sorted(pvals.items(), key=lambda kv: kv[1])
+    m = len(items)
+    out, run = {}, 0.0
+    for i, (k, p) in enumerate(items):
+        run = max(run, min(1.0, (m - i) * p))
+        out[k] = run
+    return out
+
+
 def overhead_bench():
-    from .dynamics import KF
-    from .layers import IMUMonitor
+    """Per-layer CPU cost of the core operations (ms).  L3 is a full radar scan
+    (6 vessels, association included), amortised over the 10 Hz cycle; L4 is
+    the real trust and state-machine update."""
+    from .dynamics import KF, vessel_tracks
+    from .layers import IMUMonitor, L2Detector, L3CrossCheck, L4Trust
     from .link import Frame, L1Verifier, signature, _ts, GCS_SYS, GCS_COMP, MSG_HEARTBEAT
+    from .config import RADAR_SCAN
     reps = 20000
     kf = KF(np.zeros(4))
+    l2d = L2Detector()
     z = np.array([1., 1., .1, .1])
     a = np.array([.1, .1])
     tracemalloc.start()
     t = time.perf_counter()
     for _ in range(reps):
         kf.predict(a)
-        kf.innovation(z)
+        l2d.update(kf.innovation(z), False)
         kf.update(z, 1.0)
     l2 = (time.perf_counter() - t) / reps * 1e3
     _, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
-    ap = np.random.rand(6, 2) * 100
-    rr = np.random.rand(6, 2) * 100
+    # L3: full scan
+    rng = np.random.default_rng(0)
+    nv = 6
+    ves = vessel_tracks(10, nv, rng)
+    vv = (ves[:, 1] - ves[:, 0]) / DT
+    l3o = L3CrossCheck(nv, rng)
+    l3o.init_ais(ves[:, 0], vv, rng, nv)
+    x = np.array([250., 250., 8., 0.])
+    P2 = np.eye(2)
+    reps_l3 = 2000
     t = time.perf_counter()
-    for _ in range(reps):
-        C = np.linalg.norm(ap[:, None, :] - rr[None, :, :], axis=2)
-        linear_sum_assignment(C)
-    l3 = (time.perf_counter() - t) / reps * 1e3
+    for i in range(reps_l3):
+        l3o.scan(0, float(i), x, x, ves, vv, nv, [], False, np.zeros(2), 0.0, rng,
+                 False, False, [], [], kf_P=P2)
+    l3_scan = (time.perf_counter() - t) / reps_l3 * 1e3
+    l3 = l3_scan * DT / RADAR_SCAN
+    # L4: trust updates and state machine
+    l4o = L4Trust()
+    kfb = KF(np.zeros(4))
     t = time.perf_counter()
-    for _ in range(reps):
-        x = 0.5 * 0.9  # trust update + state machine (scalar)
+    for i in range(reps):
+        l4o.update_trust(False, False)
+        l4o.update_imu_trust(False, i * DT)
+        l4o.update_state(False, kfb, i * DT)
     l4 = (time.perf_counter() - t) / reps * 1e3
     msg = b'x' * 50
     t = time.perf_counter()
     for _ in range(reps):
         hashlib.sha256(b'secret' + msg).digest()[:6]
     l1 = (time.perf_counter() - t) / reps * 1e3
-    # L1 as executed in the loop: full verification of a signed frame
-    # (signature recomputation, constant-time compare, replay window)
     key = bytes(32)
     ver = L1Verifier(key)
     frames = []
@@ -130,14 +170,13 @@ def overhead_bench():
     for fr in frames:
         ver.check(fr)
     l1_verify = (time.perf_counter() - t) / reps * 1e3
-    # L2 IMU monitor (acceleration and heading residuals, both tests)
     mon = IMUMonitor()
-    av = np.array([.1, .1]); vv = np.array([8., 0.])
+    av = np.array([.1, .1]); vv2 = np.array([8., 0.])
     t = time.perf_counter()
     for _ in range(reps):
-        mon.update(av, vv, True, 0.01)
+        mon.update(av, vv2, True, 0.01)
     l2_imu = (time.perf_counter() - t) / reps * 1e3
-    return dict(L1=l1, L2=l2, L3=l3, L4=l4, total=l1 + l2 + l3 + l4,
+    return dict(L1=l1, L2=l2, L3=l3, L3_scan=l3_scan, L4=l4, total=l1 + l2 + l3 + l4,
                 mem_mb=peak / 1e6, mav_bytes=MAVLINK_SIGN_BYTES,
                 L1_verify=l1_verify, L2_imu=l2_imu,
                 total_ext=l1_verify + l2 + l2_imu + l3 + l4)
@@ -196,21 +235,25 @@ def roc_bench(N, dur=260.0):
 
 
 def sample_trajectory(dur=260.0, base_seed=2000, max_search=100):
-    """Extract coordinates for a representative detected S1 trial under
-    GNSS jump (A1) for Figure 4."""
+    """Representative S1 run (A1 + A3) for Figure 4, taken from the S1
+    evaluation seeds (base 2000), so the plotted run is one of the runs in
+    the mission table."""
     from .simulation import run_once
     from .config import GEOFENCE, DT, T_EVAL
     for sd in range(base_seed, base_seed + max_search):
-        r = run_once(['A1'], 'F', sd, dur, trace=True)
+        r = run_once(['A1', 'A3'], 'F', sd, dur, trace=True)
         if r['detected'] and r['alarm_t'] and r['maxerr'] < GEOFENCE:
             return {
                 'seed': sd,
+                'attacks': ['A1', 'A3'],
+                'title': f'S1 (A1 + A3), seed {sd}',
                 'k_on': int(r['k_on']),
-                'alarm_t': float(r['alarm_t']) if r['alarm_t'] is not None else None,
+                'alarm_t': float(r['alarm_t']),
                 't_on': float(r['t_on']),
                 'truth': np.round(r['truth'], 2).tolist(),
                 'xhat': np.round(r['xhat'], 2).tolist(),
                 'gnss': np.round(r['gnss'], 2).tolist(),
+                'gnss_valid': [int(v) for v in r['gnss_valid']],
                 'dt': float(DT),
                 't_eval': float(T_EVAL),
                 'geofence': float(GEOFENCE),

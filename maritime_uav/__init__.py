@@ -13,6 +13,6 @@ from .simulation import run_once
 from .calibration import calibrate, train_if, if_eval
 from .evaluation import (ci95, mc, binom_ci, robustness,
                          calib_generalization, mcnemar_p, overhead_bench,
-                         summarize, link_summary,
+                         summarize, link_summary, far_summary, holm,
                          roc_bench, sample_trajectory)
 from .cli import main

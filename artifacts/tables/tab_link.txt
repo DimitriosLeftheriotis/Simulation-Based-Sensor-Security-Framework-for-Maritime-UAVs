@@ -1,0 +1,12 @@
+% ===== tab:link (hijack %, rejected/run, breach %, max cross-track m, link-loss abort %) =====
+\multirow{3}{*}{A7 jamming} & B1 (unsigned) & $0$ & -- & $0$ & $8.6$ & $98$\\
+ & F$-$L1 & $0$ & -- & $0$ & $8.6$ & $11$\\
+ & F & $0$ & $0.0$ & $0$ & $8.6$ & $11$\\
+\midrule
+\multirow{3}{*}{A7 replay} & B1 (unsigned) & $100$ & -- & $86$ & $129.3$ & $0$\\
+ & F$-$L1 & $100$ & -- & $86$ & $129.3$ & $0$\\
+ & F & $0$ & $3.0$ & $0$ & $8.6$ & $0$\\
+\midrule
+\multirow{3}{*}{A7 injection} & B1 (unsigned) & $100$ & -- & $100$ & $261.1$ & $0$\\
+ & F$-$L1 & $100$ & -- & $100$ & $261.1$ & $0$\\
+ & F & $0$ & $169.4$ & $0$ & $8.6$ & $0$\\

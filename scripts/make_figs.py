@@ -41,40 +41,47 @@ def roc_fig(full, out_path):
 
 def traj_fig(full, out_path):
     r = full['traj']
-    truth = np.array(r['truth'])
-    xhat = np.array(r['xhat'])
-    gnss = np.array(r['gnss'])
+    truth, xhat, gnss = (np.array(r[k]) for k in ('truth', 'xhat', 'gnss'))
+    valid = np.array(r.get('gnss_valid', [1] * len(gnss)), bool)
     dt = r.get('dt', 0.1)
     t_eval = r.get('t_eval', 40.0)
     k_on = r['k_on']
-    ka = int(r['alarm_t'] / dt) if r.get('alarm_t') is not None else k_on
-    sl = slice(max(0, k_on - 300), min(len(truth), k_on + int(t_eval / dt)))
+    ka = int(round(r['alarm_t'] / dt)) if r.get('alarm_t') is not None else k_on
+    k_end = min(len(truth), k_on + int(t_eval / dt))
+    sl = slice(max(0, k_on - 300), k_end)
+    shown = np.zeros(len(gnss), bool); shown[k_on:k_end] = True; shown &= valid
 
     fig, ax = plt.subplots(figsize=(3.6, 3.2))
-    ax.plot(truth[sl, 0], truth[sl, 1], color=OI['green'], lw=2, label='True path')
-    ax.plot(xhat[sl, 0], xhat[sl, 1], '--', color=OI['blue'], lw=1.6, label='Estimate (framework)')
-    ax.plot(gnss[k_on:k_on+int(t_eval/dt), 0], gnss[k_on:k_on+int(t_eval/dt), 1],
-            '.', color=OI['red'], ms=2.5, alpha=0.5, label='Spoofed GNSS')
-    ax.plot(*truth[k_on], 'o', color=OI['orange'], ms=7, label='Attack onset')
-    ax.plot(*truth[ka], 's', color=OI['purple'], ms=7, label='Framework alarm')
+    ax.plot(truth[sl, 0], truth[sl, 1], color=OI['green'], lw=2.6, label='True path', zorder=2)
+    ax.plot(xhat[sl, 0], xhat[sl, 1], '--', color=OI['blue'], lw=1.3, label='Estimate (framework)', zorder=3)
+    ax.plot(gnss[shown, 0], gnss[shown, 1], '.', color=OI['red'], ms=2.5, alpha=0.5,
+            label='Spoofed GNSS (valid fixes)', zorder=1)
+    lag = (r['alarm_t'] - r['t_on']) if r.get('alarm_t') is not None else 0.0
+    ax.plot(*truth[ka], 's', color=OI['purple'], ms=5, label=f'Framework alarm (+{lag:.2f} s)', zorder=5)
+    ax.plot(*truth[k_on], 'o', mfc='none', mec=OI['orange'], mew=1.8, ms=11, label='Attack onset', zorder=6)
     ax.set_xlabel('East (m)'); ax.set_ylabel('North (m)'); ax.set_aspect('equal', 'datalim')
-    ax.legend(loc='best', fontsize=7, frameon=False)
-    ax.set_title('Representative run (S1, GNSS jump)', fontsize=9)
+    ax.legend(loc='best', fontsize=6.5, frameon=False)
+    ax.set_title('Representative run: ' + r.get('title', 'S1'), fontsize=8.5)
     fig.tight_layout(); fig.savefig(out_path)
-    seed_str = f" (seed {r['seed']})" if 'seed' in r else ""
-    print(f'wrote {out_path}{seed_str}')
+    print(f"wrote {out_path} (seed {r.get('seed')})")
+
+
+def _wilson_half(p, n, z=1.96):
+    return z * np.sqrt((p * (1 - p) + z * z / (4 * n)) / n) / (1 + z * z / n)
 
 
 def robust_fig(full, out_path):
-    d = full['robustness']; innov = full['detection']['A2c']['L2']['dr']
+    d = full['robustness']; n = full['N']
+    innov = full['detection']['A2c']['L2']['dr']
     rv, rp = d['vessels'], d['radar_pd']
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(5.4, 2.6))
-    a1.plot([int(k) for k in rv], list(rv.values()), 'o-', color=OI['blue'], lw=2)
-    a1.set_xlabel('Vessels in view'); a1.set_ylabel('A2 detection rate')
+    xv, yv = [int(k) for k in rv], list(rv.values())
+    a1.errorbar(xv, yv, yerr=[_wilson_half(v, n) for v in yv], fmt='o-', color=OI['blue'], lw=2, capsize=3)
+    a1.set_xlabel('Vessels in the scene'); a1.set_ylabel('A2 detection rate')
     a1.set_ylim(-0.03, 1.03); a1.axhline(innov, ls=':', color=OI['orange'], lw=1)
-    a1.text(max(int(k) for k in rv), innov - 0.03, 'innovation-only', fontsize=6.5,
-            ha='right', va='top', color=OI['orange'])
-    a2.plot([float(k) for k in rp], list(rp.values()), 's-', color=OI['green'], lw=2)
+    a1.text(max(xv), innov - 0.03, 'innovation-only', fontsize=6.5, ha='right', va='top', color=OI['orange'])
+    xp, yp = [float(k) for k in rp], list(rp.values())
+    a2.errorbar(xp, yp, yerr=[_wilson_half(v, n) for v in yp], fmt='s-', color=OI['green'], lw=2, capsize=3)
     a2.set_xlabel('Radar detection prob. $P_d$'); a2.set_ylabel('A2 detection rate')
     a2.set_ylim(-0.03, 1.03)
     fig.tight_layout(); fig.savefig(out_path); print(f'wrote {out_path}')

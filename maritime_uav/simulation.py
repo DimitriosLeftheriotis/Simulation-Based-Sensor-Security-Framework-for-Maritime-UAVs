@@ -18,7 +18,7 @@ from .config import (
     GNSS_TIMEOUT, RECOVER_TOL, GEOFENCE, DET_WINDOW, CFG,
 )
 from .dynamics import make_reference, vessel_tracks, KF, route_distance
-from .attacks import inject_attacks, a4_heading_bias
+from .attacks import inject_attacks, a4_heading_bias, random_vector
 from .layers import (L2Detector, B2Detector, IMUMonitor, L3CrossCheck,
                      L4Trust, fuse)
 from .link import C2Link
@@ -42,16 +42,12 @@ def run_once(attacks, config, seed, duration=260.0, ablation=None,
     # Attack parameters (random per trial)
     t_on = rng.uniform(60, 120); k_on = int(t_on / DT)
     k_eval = min(n, k_on + int(T_EVAL / DT))
-    jump = rng.uniform(50, 500) * np.array([np.cos(rng.uniform(0, 2 * np.pi)),
-                                             np.sin(rng.uniform(0, 2 * np.pi))])
-    drate = rng.uniform(0.2, 1.0)
-    drift = drate * np.array([np.cos(rng.uniform(0, 2 * np.pi)),
-                              np.sin(rng.uniform(0, 2 * np.pi))])
+    # v5: unit-norm random directions (see attacks.random_vector)
+    jump = random_vector(rng, 50, 500)
+    drift = random_vector(rng, 0.2, 1.0)
     jam_dur = rng.uniform(10, 60); k_jam_off = k_on + int(jam_dur / DT)
-    imu_bias = rng.uniform(0.2, 1.0) * np.array([np.cos(rng.uniform(0, 2 * np.pi)),
-                                                   np.sin(rng.uniform(0, 2 * np.pi))])
-    ais_off = rng.uniform(80, 300) * np.array([np.cos(rng.uniform(0, 2 * np.pi)),
-                                                np.sin(rng.uniform(0, 2 * np.pi))])
+    imu_bias = random_vector(rng, 0.2, 1.0)
+    ais_off = random_vector(rng, 80, 300)
     psi_bias = np.deg2rad(rng.uniform(2.0, 6.0))
 
     # Independent stream for the IMU monitor (AHRS / magnetometer noise) and
@@ -95,7 +91,10 @@ def run_once(attacks, config, seed, duration=260.0, ablation=None,
     alarm_t = None; false_before = False; last_fix_t = 0.0
     alarm_src = None; imu_alarm_t = None
     prev_v = ref_vel[0].copy()
-    false_tracks = 0; link_bad = False
+    acc_prev = np.zeros(2)            # acceleration applied over the previous step
+    prev_alarm = False; alarm_onsets = 0; alarm_onsets_pre = 0
+    gvalid_hist = np.zeros(n, bool)
+    radar_suppressed = 0; link_bad = False
 
     for k in range(n):
         t = k * DT
@@ -128,7 +127,9 @@ def run_once(attacks, config, seed, duration=260.0, ablation=None,
             truth[k + 1, 2:] = v_cmd
 
         # IMU
-        a_imu = acc + rng.normal(0, SIGMA_IMU_A, 2)
+        # v5 timing fix: the IMU sample at step k measures the acceleration
+        # applied over (k-1, k], i.e. the command of the previous step
+        a_imu = acc_prev + rng.normal(0, SIGMA_IMU_A, 2)
 
         # GNSS measurement (before attack injection)
         gnss_valid = True
@@ -141,14 +142,14 @@ def run_once(attacks, config, seed, duration=260.0, ablation=None,
             gnss_valid, link_bad = inject_attacks(
                 z, a_imu, attacks, t, t_on, k, k_jam_off,
                 jump, drift, imu_bias, rng, link_bad,
-                acc_true=acc, a4s_scale=a4s_scale)
+                acc_true=acc_prev, a4s_scale=a4s_scale)
 
         # KF predict (IMU isolated: model-based prediction from the commanded
         # acceleration with model mismatch, inflated process noise)
         imu_iso = use_L4 and use_imu_mon and l4.imu_isolated
-        if use_filter:
+        if use_filter and k > 0:          # predict (k-1) -> k before fusing z_k
             if imu_iso:
-                kf.predict(acc + model_bias + model_noise[k], Q_CV)
+                kf.predict(acc_prev + model_bias + model_noise[k], Q_CV)
             else:
                 kf.predict(a_imu)
 
@@ -164,7 +165,7 @@ def run_once(attacks, config, seed, duration=260.0, ablation=None,
                 nu = z - kf.x
                 feats.append(([d2, float(np.hypot(nu[0], nu[1])),
                                float(np.hypot(nu[2], nu[3])),
-                               float(np.hypot(kf.x[2], kf.x[3]))], k >= k_on))
+                               float(np.hypot(kf.x[2], kf.x[3]))], k >= k_on, k))
                 if rec and k < k_on:
                     d2rec.append(d2)
                 if use_gate:
@@ -198,8 +199,8 @@ def run_once(attacks, config, seed, duration=260.0, ablation=None,
                 k, t, truth[k], kf.x, vessels, vves, n_vessels,
                 attacks, attacking, ais_off, psi_bias, rng,
                 k >= k_on, rec and k < k_on, cmrec, sprec,
-                mag_heading=imu_iso, mag_off=mag_off)
-            false_tracks += ft
+                mag_heading=imu_iso, mag_off=mag_off, kf_P=kf.P[:2, :2])
+            radar_suppressed += ft
 
         # L4 trust + isolation
         if use_L4:
@@ -223,6 +224,11 @@ def run_once(attacks, config, seed, duration=260.0, ablation=None,
                      thr_alarm if config == 'B2' else
                      (l2_alarm or cm_alarm or ais_alarm or imu_alarm) if config == 'F' else False)
         alarm = nav_alarm or (link_alarm and config == 'F')
+        if alarm and not prev_alarm:            # alarm onsets (false-alarm rate)
+            alarm_onsets += 1
+            if t < t_on:
+                alarm_onsets_pre += 1
+        prev_alarm = alarm
         if alarm:
             if t_on <= t <= t_on + DET_WINDOW and alarm_t is None:
                 alarm_t = t
@@ -238,9 +244,10 @@ def run_once(attacks, config, seed, duration=260.0, ablation=None,
         if use_L4:
             l4.update_state(nav_alarm, kf, t)
 
-        xhat_hist[k] = kf.x[:2]; gnss_hist[k] = z[:2]
+        xhat_hist[k] = kf.x[:2]; gnss_hist[k] = z[:2]; gvalid_hist[k] = gnss_valid
         if k_on <= k < k_eval:
             errs.append(np.linalg.norm(kf.x[:2] - truth[k, :2]))
+        acc_prev = acc.copy()
 
     # --- Post-run metrics ---
     errs = np.array(errs) if errs else np.array([0.0])
@@ -261,7 +268,8 @@ def run_once(attacks, config, seed, duration=260.0, ablation=None,
 
     out = dict(detected=detected, latency=latency, rmse=rmse, maxerr=maxerr,
                recov=recov, completion=completion, false_before=false_before,
-               false_tracks=false_tracks,
+               radar_suppressed=radar_suppressed, t_on=float(t_on),
+               alarm_onsets=alarm_onsets, alarm_onsets_pre=alarm_onsets_pre,
                peak_cusum=l2det.peak_cusum, peak_cm=l3.peak_cm,
                aborted=l4.aborted,
                alarm_src=alarm_src,
@@ -277,5 +285,5 @@ def run_once(attacks, config, seed, duration=260.0, ablation=None,
         out['imu_a'] = imu_a_rec; out['imu_h'] = imu_h_rec
     if trace:
         out.update(truth=truth[:, :2].copy(), xhat=xhat_hist, gnss=gnss_hist,
-                   t_on=t_on, alarm_t=alarm_t, k_on=k_on)
+                   t_on=t_on, alarm_t=alarm_t, k_on=k_on, gnss_valid=gvalid_hist.copy())
     return out
