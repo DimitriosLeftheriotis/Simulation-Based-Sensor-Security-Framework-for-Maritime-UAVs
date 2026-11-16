@@ -1,0 +1,6 @@
+# Python packages used to produce the results (exact versions for reproduction).
+# Tested on Python 3.14; later 3.x should also work.
+numpy==2.5.4
+scipy==1.18.1
+scikit-learn==1.9.1
+matplotlib==3.11.2

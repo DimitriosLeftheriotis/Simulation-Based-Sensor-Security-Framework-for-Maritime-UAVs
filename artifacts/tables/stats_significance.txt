@@ -1,0 +1,4 @@
+% ===== significance (for the text) =====
+% A2c F vs L2 (McNemar) p = 3.55e-15
+% A2c F vs IF (McNemar) p = 0.00143
+% S1 F vs B1 RMSE (Wilcoxon) p = 2.12e-13

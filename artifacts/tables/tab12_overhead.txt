@@ -1,0 +1,7 @@
+% ===== tab:overhead =====
+L1 signing and validation & $0.002$ & -- & 0.002\\
+L2 monitors & $0.194$ & -- & --\\
+L3 cross-sensor consistency & $0.017$ & -- & --\\
+L4 trust and state machine & $0.000$ & -- & --\\
+\midrule
+Total & $0.212$ & $<0.01$ & $0.002$\\

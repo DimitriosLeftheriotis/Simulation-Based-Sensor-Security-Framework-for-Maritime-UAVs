@@ -1,0 +1,6 @@
+% ===== tab:robustness (A2c maritime detection) =====
+Vessels in view & $2$ & $3$ & $4$ & $6$ & $8$\\
+Detection rate & $0.44$ & $0.96$ & $0.88$ & $0.94$ & $0.90$\\
+\midrule
+Radar $P_d$ & $0.5$ & $0.7$ & $0.9$\\
+Detection rate & $0.90$ & $0.93$ & $0.88$\\
